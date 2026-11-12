@@ -21,7 +21,7 @@
 **OpenRAR** 是一个采用净室设计（Clean-Room Design）、以 **GNU GENERAL PUBLIC LICENSE Version 3 or later(GPL v3.0-or-later)** 许可协议授权的 RAR 5.0 压缩器与解压器。
 
 * **零专有代码**：本项目**不直接基于来自 RARLAB 的任何代码**（不包含 `unrar` 源码或任何商业组件），所有压缩、解压、加密、哈希及容器读写逻辑均依据公开的 [RAR 5.0 Archive Format Specification](https://www.rarlab.com/technote.htm) 与开源项目 [`unrar-free`](https://gitlab.com/bgermann/unrar-free) 的设计思想独立实现。
-* **无任何商业激活机制**：彻底移除了官方 CLI 中的注册密钥检查（`rarreg.key`）、评估版提示及 `已注册给 ...` 等激活相关机制。
+* ~~**无任何商业激活机制**：彻底移除了官方 CLI 中的注册密钥检查（`rarreg.key`）、评估版提示及 `已注册给 ...` 等激活相关机制。~~ 后续版本将增加该功能（并不会影响任何功能使用）
 * **双向 100% 兼容**：
   * 由本工具 `rar.exe` 创建的 RAR 5.0 压缩包（含存储 `-m0`、LZSS+Huffman 压缩 `-m1`..`-m5`、固实模式 `-s`、AES-256 加密 `-p`/`-hp`、BLAKE2sp 校验 `-htb`、注释 `-z`、自解压 `-sfx`、分卷 `-v`、恢复记录 `-rr`）可直接被官方 WinRAR (`Rar.exe`) 校验与解压。
   * 由官方 WinRAR (`Rar.exe`) 创建的 RAR 5.0 压缩包可直接被本工具列表（`l`/`v`/`lt`/`lb`）、测试（`t`）、解压（`x`/`e`/`p`）与修改（`c`/`cw`/`rn`/`d`/`k`/`r`）。
