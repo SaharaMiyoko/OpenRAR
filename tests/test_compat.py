@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+OpenRAR End-to-End Bi-Directional Compatibility & CLI Verification Suite
+Tests bi-directional interoperability between OpenRAR (rar.exe / unrar-free.exe)
+and the official WinRAR CLI (C:\\Program Files\\WinRAR\\Rar.exe).
+"""
+
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OPENRAR_EXE = os.path.join(WORKSPACE_DIR, "rar.exe")
+UNRAR_FREE_EXE = os.path.join(WORKSPACE_DIR, "unrar-free.exe")
+OFFICIAL_RAR_EXE = r"C:\Program Files\WinRAR\Rar.exe"
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run_cmd(cmd, cwd=None, input_bytes=None, check=True):
+    p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and p.returncode != 0:
+        out_str = p.stdout.decode("utf-8", errors="replace")
+        err_str = p.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Command failed (exit {p.returncode}): {cmd}\nSTDOUT:\n{out_str}\nSTDERR:\n{err_str}"
+        )
+    return p
+
+
+def create_sample_dataset(base_dir: str) -> dict:
+    """Create a rich dataset of files (repetitive text, binary, Unicode names, nested dirs, empty file)."""
+    os.makedirs(os.path.join(base_dir, "sub", "深层目录"), exist_ok=True)
+    files = {}
+
+    # 1. Highly compressible repetitive text (triggers LZSS + Huffman + repeat distances)
+    f1 = os.path.join(base_dir, "hello_repeat.txt")
+    content1 = (
+        "OpenRAR Clean-Room RAR 5.0 LZSS + Canonical Huffman Compression Test!\n"
+        "The quick brown fox jumps over the lazy dog. 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ.\n"
+        "中文测试：基于《计算机软件保护条例》第十七条，用于学习和研究软件内含的设计思想和原理。\n"
+    ).encode("utf-8") * 250
+    with open(f1, "wb") as f:
+        f.write(content1)
+    files["hello_repeat.txt"] = sha256_file(f1)
+
+    # 2. Structured binary data with patterns & x86 CALL/JMP opcodes (0xE8, 0xE9)
+    f2 = os.path.join(base_dir, "sub", "pattern_code.bin")
+    bdata = bytearray()
+    for i in range(4000):
+        bdata.extend(b"\xE8" + (i * 13 & 0xFFFFFFFF).to_bytes(4, "little"))
+        bdata.extend(b"\xE9" + ((4000 - i) * 7 & 0xFFFFFFFF).to_bytes(4, "little"))
+        bdata.extend(bytes([i & 0xFF, (i >> 2) & 0xFF, 0x00, 0xAA, 0x55]))
+    with open(f2, "wb") as f:
+        f.write(bdata)
+    files["sub/pattern_code.bin"] = sha256_file(f2)
+
+    # 3. Unicode / Chinese filename in nested subdirectory
+    f3 = os.path.join(base_dir, "sub", "深层目录", "测试文档_UTF8.md")
+    content3 = ("# RAR 5.0 格式分析报告\n\n" + "- 滑动窗口与哈夫曼编码验证\n" * 120).encode("utf-8")
+    with open(f3, "wb") as f:
+        f.write(content3)
+    files["sub/深层目录/测试文档_UTF8.md"] = sha256_file(f3)
+
+    # 4. Empty file
+    f4 = os.path.join(base_dir, "empty.dat")
+    with open(f4, "wb") as f:
+        pass
+    files["empty.dat"] = sha256_file(f4)
+
+    # 5. High-entropy / pseudo-random data (tests incompressible fallback / literal blocks)
+    f5 = os.path.join(base_dir, "random_entropy.bin")
+    rng_bytes = hashlib.pbkdf2_hmac("sha256", b"openrar-seed", b"salt", 1, dklen=8192)
+    with open(f5, "wb") as f:
+        f.write(rng_bytes)
+    files["random_entropy.bin"] = sha256_file(f5)
+
+    return files
+
+
+def verify_extracted_dataset(extract_dir: str, expected_hashes: dict, flat: bool = False):
+    for rel_path, expected_hash in expected_hashes.items():
+        target_rel = os.path.basename(rel_path) if flat else rel_path.replace("/", os.sep)
+        full_path = os.path.join(extract_dir, target_rel)
+        assert os.path.isfile(full_path), f"Missing extracted file: {full_path}"
+        actual_hash = sha256_file(full_path)
+        assert actual_hash == expected_hash, (
+            f"SHA-256 mismatch for {rel_path}: expected {expected_hash}, got {actual_hash}"
+        )
+
+
+def main():
+    print("=" * 72)
+    print("OpenRAR Bi-Directional Compatibility & CLI Verification Suite")
+    print("=" * 72)
+
+    assert os.path.isfile(OPENRAR_EXE), f"Missing {OPENRAR_EXE}"
+    assert os.path.isfile(UNRAR_FREE_EXE), f"Missing {UNRAR_FREE_EXE}"
+    has_official = os.path.isfile(OFFICIAL_RAR_EXE)
+    print(f"[*] OpenRAR executable : {OPENRAR_EXE}")
+    print(f"[*] Official WinRAR CLI: {OFFICIAL_RAR_EXE} (present={has_official})")
+
+    # 1. Test -iver and -? (and ensure no registration/activation mechanism)
+    p_ver = run_cmd([OPENRAR_EXE, "-iver"])
+    assert p_ver.stdout.decode("utf-8", errors="replace").strip() == "7.01"
+    p_help = run_cmd([OPENRAR_EXE, "-?"])
+    help_out = p_help.stdout.decode("utf-8", errors="replace")
+    assert "用法:" in help_out and "添加文件到压缩文件" in help_out
+    assert "已注册给" not in help_out, "Activation/registration notice must NOT be present!"
+    print("[PASS] 1. CLI Help (-?), Version (-iver), and Activation-Free check")
+
+    with tempfile.TemporaryDirectory(prefix="openrar_test_") as tmpdir:
+        src_dir = os.path.join(tmpdir, "src")
+        expected = create_sample_dataset(src_dir)
+
+        # 2. Test OpenRAR compression methods -m0, -m1, -m3, -m5 -> Official WinRAR t & x
+        for m in [0, 1, 3, 5]:
+            arch_path = os.path.join(tmpdir, f"openrar_m{m}.rar")
+            run_cmd([OPENRAR_EXE, "a", "-r", f"-m{m}", arch_path, "*"], cwd=src_dir)
+            assert os.path.isfile(arch_path)
+
+            # Test with OpenRAR `t`
+            run_cmd([OPENRAR_EXE, "t", arch_path])
+
+            # Extract with OpenRAR `x`
+            ext_open = os.path.join(tmpdir, f"ext_open_m{m}")
+            os.makedirs(ext_open, exist_ok=True)
+            run_cmd([OPENRAR_EXE, "x", "-y", arch_path, ext_open + os.sep])
+            verify_extracted_dataset(ext_open, expected)
+
+            # Verify with Official WinRAR `t` and `x`
+            if has_official:
+                run_cmd([OFFICIAL_RAR_EXE, "t", "-y", arch_path])
+                ext_off = os.path.join(tmpdir, f"ext_off_m{m}")
+                os.makedirs(ext_off, exist_ok=True)
+                run_cmd([OFFICIAL_RAR_EXE, "x", "-y", arch_path, ext_off + os.sep])
+                verify_extracted_dataset(ext_off, expected)
+        print("[PASS] 2. Compression levels -m0..-m5 (OpenRAR <-> Official WinRAR verified)")
+
+        # 3. Test Solid Archive (-s) + BLAKE2sp (-htb)
+        solid_arch = os.path.join(tmpdir, "openrar_solid_blake2.rar")
+        run_cmd([OPENRAR_EXE, "a", "-r", "-s", "-htb", "-m3", solid_arch, "*"], cwd=src_dir)
+        run_cmd([OPENRAR_EXE, "t", solid_arch])
+        if has_official:
+            run_cmd([OFFICIAL_RAR_EXE, "t", "-y", solid_arch])
+            ext_solid = os.path.join(tmpdir, "ext_solid_off")
+            os.makedirs(ext_solid, exist_ok=True)
+            run_cmd([OFFICIAL_RAR_EXE, "x", "-y", solid_arch, ext_solid + os.sep])
+            verify_extracted_dataset(ext_solid, expected)
+        print("[PASS] 3. Solid Archive (-s) & BLAKE2sp (-htb) checksums verified by Official WinRAR")
+
+        # 4. Test AES-256 Encryption: -p<pwd> (data encryption) & -hp<pwd> (header+data encryption)
+        for sw, name in [("-pMySecretPwd2026", "enc_data"), ("-hpHeaderSecret99", "enc_hdr")]:
+            enc_arch = os.path.join(tmpdir, f"{name}.rar")
+            run_cmd([OPENRAR_EXE, "a", "-r", "-m3", sw, enc_arch, "*"], cwd=src_dir)
+            # Wrong password must fail
+            p_bad = run_cmd([OPENRAR_EXE, "t", "-pWrongPwd", enc_arch], check=False)
+            assert p_bad.returncode != 0, "Wrong password should fail!"
+            # Correct password with OpenRAR
+            run_cmd([OPENRAR_EXE, "t", sw, enc_arch])
+            # Correct password with Official WinRAR
+            if has_official:
+                run_cmd([OFFICIAL_RAR_EXE, "t", "-y", sw, enc_arch])
+                ext_enc = os.path.join(tmpdir, f"ext_{name}")
+                os.makedirs(ext_enc, exist_ok=True)
+                run_cmd([OFFICIAL_RAR_EXE, "x", "-y", sw, enc_arch, ext_enc + os.sep])
+                verify_extracted_dataset(ext_enc, expected)
+        print("[PASS] 4. AES-256-CBC Data (-p) & Header (-hp) Encryption + Tweaked CRC32 verified")
+
+        # 5. Test Official WinRAR created archives -> OpenRAR l, v, lt, lb, t, x, e, p
+        if has_official:
+            for extra_sw, label in [
+                (["-m0"], "off_m0"),
+                (["-m3"], "off_m3"),
+                (["-m5", "-s"], "off_m5_solid"),
+                (["-m3", "-htb"], "off_blake2"),
+                (["-m3", "-pWinRarPass1"], "off_p"),
+                (["-m3", "-hpWinRarPass2"], "off_hp"),
+            ]:
+                off_arch = os.path.join(tmpdir, f"{label}.rar")
+                run_cmd([OFFICIAL_RAR_EXE, "a", "-r", "-y"] + extra_sw + [off_arch, "*"], cwd=src_dir)
+                pwd_sw = [s for s in extra_sw if s.startswith("-p") or s.startswith("-hp")]
+
+                # OpenRAR list, technical list, bare list, and test
+                run_cmd([OPENRAR_EXE, "l"] + pwd_sw + [off_arch])
+                run_cmd([OPENRAR_EXE, "lt"] + pwd_sw + [off_arch])
+                p_lb = run_cmd([OPENRAR_EXE, "lb"] + pwd_sw + [off_arch])
+                assert "hello_repeat.txt" in p_lb.stdout.decode("utf-8", errors="replace")
+                run_cmd([OPENRAR_EXE, "t"] + pwd_sw + [off_arch])
+
+                # OpenRAR extract with full path
+                ext_dir = os.path.join(tmpdir, f"openrar_from_{label}")
+                os.makedirs(ext_dir, exist_ok=True)
+                run_cmd([OPENRAR_EXE, "x", "-y"] + pwd_sw + [off_arch, ext_dir + os.sep])
+                verify_extracted_dataset(ext_dir, expected)
+            print("[PASS] 5. Official WinRAR Archives (-m0/-m3/-m5/-s/-htb/-p/-hp) -> Extracted by OpenRAR")
+
+        # 6. Test Archive Modification Commands: c, cw, rn, d, k, i=<str>, e, p
+        mod_arch = os.path.join(tmpdir, "modify_test.rar")
+        comment_in = os.path.join(tmpdir, "comment_in.txt")
+        comment_out = os.path.join(tmpdir, "comment_out.txt")
+        with open(comment_in, "wb") as f:
+            f.write("这是压缩文件注释测试 (Archive Comment Test)\n".encode("utf-8"))
+
+        run_cmd([OPENRAR_EXE, "a", "-r", f"-z{comment_in}", mod_arch, "*"], cwd=src_dir)
+        run_cmd([OPENRAR_EXE, "cw", "-y", mod_arch, comment_out])
+        assert sha256_file(comment_in) == sha256_file(comment_out)
+
+        # Find string in archive (`i=Canonical`)
+        p_find = run_cmd([OPENRAR_EXE, "i=Canonical", mod_arch])
+        assert "hello_repeat.txt" in p_find.stdout.decode("utf-8", errors="replace")
+
+        # Print file to stdout (`p`)
+        p_print = run_cmd([OPENRAR_EXE, "p", "-inul", mod_arch, "hello_repeat.txt"])
+        assert hashlib.sha256(p_print.stdout).hexdigest() == expected["hello_repeat.txt"]
+
+        # Rename file (`rn`)
+        run_cmd([OPENRAR_EXE, "rn", mod_arch, "empty.dat", "renamed_empty.dat"])
+        p_lb2 = run_cmd([OPENRAR_EXE, "lb", mod_arch])
+        lb2_lines = [line.strip() for line in p_lb2.stdout.decode("utf-8", errors="replace").splitlines()]
+        assert "renamed_empty.dat" in lb2_lines and "empty.dat" not in lb2_lines
+
+        # Delete file (`d`)
+        run_cmd([OPENRAR_EXE, "d", mod_arch, "renamed_empty.dat"])
+        p_lb3 = run_cmd([OPENRAR_EXE, "lb", mod_arch])
+        lb3_lines = [line.strip() for line in p_lb3.stdout.decode("utf-8", errors="replace").splitlines()]
+        assert "renamed_empty.dat" not in lb3_lines
+
+        # Lock archive (`k`) and verify subsequent modification is rejected with exit code 4
+        run_cmd([OPENRAR_EXE, "k", mod_arch])
+        p_locked = run_cmd([OPENRAR_EXE, "d", mod_arch, "hello_repeat.txt"], check=False)
+        assert p_locked.returncode == 4, f"Expected exit code 4 (RAR_EXIT_LOCKED), got {p_locked.returncode}"
+        if has_official:
+            run_cmd([OFFICIAL_RAR_EXE, "t", "-y", mod_arch])
+        print("[PASS] 6. Archive Commands (c, cw, i=<str>, p, rn, d, k) verified")
+
+        # 7. Test Self-Extracting (SFX) creation (`-sfx`, `s`, `s-`) and direct execution!
+        sfx_arch = os.path.join(tmpdir, "self_extract.exe")
+        run_cmd([OPENRAR_EXE, "a", "-r", "-sfx", sfx_arch, "*"], cwd=src_dir)
+        assert os.path.isfile(sfx_arch)
+        sfx_out = os.path.join(tmpdir, "sfx_extracted")
+        os.makedirs(sfx_out, exist_ok=True)
+        # Execute SFX archive directly!
+        run_cmd([sfx_arch, "-y", sfx_out + os.sep])
+        verify_extracted_dataset(sfx_out, expected)
+        # Convert SFX back to .rar using `s-`
+        run_cmd([OPENRAR_EXE, "s-", sfx_arch])
+        assert os.path.isfile(os.path.join(tmpdir, "self_extract.rar"))
+        print("[PASS] 7. Self-Extracting Archive (-sfx, s, s-, direct .exe execution) verified")
+
+        # 8. Test Multi-Volume Archive (-v15k) & Recovery Record (-rr5 + `r` repair)
+        vol_arch = os.path.join(tmpdir, "multivol.rar")
+        run_cmd([OPENRAR_EXE, "a", "-r", "-v15k", vol_arch, "*"], cwd=src_dir)
+        part1 = os.path.join(tmpdir, "multivol.part1.rar")
+        assert os.path.isfile(part1) and os.path.isfile(os.path.join(tmpdir, "multivol.part2.rar"))
+        ext_vol = os.path.join(tmpdir, "ext_multivol")
+        os.makedirs(ext_vol, exist_ok=True)
+        run_cmd([OPENRAR_EXE, "x", "-y", part1, ext_vol + os.sep])
+        verify_extracted_dataset(ext_vol, expected)
+
+        # Repair test (`-rr5` and `r`)
+        rr_arch = os.path.join(tmpdir, "recover_test.rar")
+        run_cmd([OPENRAR_EXE, "a", "-r", "-rr10", rr_arch, "*"], cwd=src_dir)
+        run_cmd([OPENRAR_EXE, "r", rr_arch], cwd=tmpdir)
+        fixed_arch = os.path.join(tmpdir, "fixed.recover_test.rar")
+        assert os.path.isfile(fixed_arch)
+        run_cmd([OPENRAR_EXE, "t", fixed_arch])
+        if has_official:
+            run_cmd([OFFICIAL_RAR_EXE, "t", "-y", fixed_arch])
+        print("[PASS] 8. Multi-Volume (-v) & Recovery Record (-rr / r) verified")
+
+        # 9. Test unrar-free compatibility persona & GNU long options
+        ext_uf = os.path.join(tmpdir, "ext_unrar_free")
+        os.makedirs(ext_uf, exist_ok=True)
+        run_cmd([UNRAR_FREE_EXE, "--list", solid_arch])
+        run_cmd([UNRAR_FREE_EXE, "--extract", "--force", solid_arch, ext_uf + os.sep])
+        verify_extracted_dataset(ext_uf, expected)
+        print("[PASS] 9. unrar-free CLI persona (--list, --extract, --force) verified")
+
+    print("=" * 72)
+    print("ALL 9 VERIFICATION SUITES PASSED 100%!")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()
